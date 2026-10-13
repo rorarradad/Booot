@@ -429,7 +429,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    # ---------- DEPOSIT FLOW (সরাসরি এখানে handle) ----------
+    # ---------- DEPOSIT FLOW ----------
     if data in ("deposit_30", "deposit_50", "deposit_100"):
         amount = {"deposit_30": 30, "deposit_50": 50, "deposit_100": 105}[data]
         context.user_data["deposit_amount"] = amount
@@ -452,7 +452,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("deposit_coin_usdt", "deposit_coin_bnb", "deposit_coin_ton", "deposit_others"):
         await deposit_coin_handler(update, context)
         return
-    # --------------------------------------------------------
+    # ----------------------------------
 
     if data == "withdraw_cancel":
         try:
@@ -591,7 +591,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # অজানা callback — listing এ fallback
     await show_listing(update, context, user_id, current_page[user_id])
 
 
@@ -726,7 +725,6 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def custom_amount_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """কাস্টম deposit amount মেসেজ হিসেবে ধরার handler."""
     if not context.user_data.get("awaiting_custom_amount"):
         return
     try:
@@ -794,6 +792,12 @@ async def get_fiat_rates() -> dict:
 
 
 async def get_crypto_prices() -> dict:
+    """
+    BNB & TON (GRAM) এর লাইভ দাম আনে।
+    ১. Binance mirror (IP ব্লক-মুক্ত) থেকে চেষ্টা করে।
+    ২. ব্যর্থ হলে CoinGecko থেকে চেষ্টা করে।
+    ৩. তাও ব্যর্থ হলে হার্ডকোড করা মান ব্যবহার করে।
+    """
     now = datetime.now().timestamp()
     if now - _crypto_cache["ts"] < 60 and _crypto_cache["prices"]:
         return _crypto_cache["prices"]
@@ -801,40 +805,67 @@ async def get_crypto_prices() -> dict:
     bnb_price = None
     ton_price = None
 
+    # ---------- ১. Binance IP-ব্লক-মুক্ত মিরর ----------
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            bnb_resp, ton_resp = await asyncio.gather(
-                client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BNBUSDT"}),
-                client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "GRAMUSDT"}),
-            )
-            bnb_data = bnb_resp.json()
-            ton_data = ton_resp.json()
-            if "price" in bnb_data:
-                bnb_price = float(bnb_data["price"])
-            if "price" in ton_data:
-                ton_price = float(ton_data["price"])
-                logger.info("TON price (Binance): $%.4f", ton_price)
-    except Exception as e:
-        logger.warning("Binance fetch failed: %s", e)
+        async with httpx.AsyncClient(timeout=10) as client:
+            # BNB
+            try:
+                bnb_resp = await client.get(
+                    "https://data-api.binance.vision/api/v3/ticker/price",
+                    params={"symbol": "BNBUSDT"},
+                )
+                bnb_resp.raise_for_status()
+                bnb_data = bnb_resp.json()
+                if "price" in bnb_data:
+                    bnb_price = float(bnb_data["price"])
+                    logger.info("BNB price (Binance Mirror): $%.2f", bnb_price)
+            except Exception as e:
+                logger.warning("Binance Mirror BNB fetch failed: %s", e)
 
-    if ton_price is None:
+            # TON (GRAM)
+            try:
+                gram_resp = await client.get(
+                    "https://data-api.binance.vision/api/v3/ticker/price",
+                    params={"symbol": "GRAMUSDT"},
+                )
+                gram_resp.raise_for_status()
+                gram_data = gram_resp.json()
+                if "price" in gram_data:
+                    ton_price = float(gram_data["price"])
+                    logger.info("TON/GRAM price (Binance Mirror): $%.4f", ton_price)
+            except Exception as e:
+                logger.warning("Binance Mirror TON/GRAM fetch failed: %s", e)
+    except Exception as e:
+        logger.warning("Binance Mirror client error: %s", e)
+
+    # ---------- ২. CoinGecko fallback ----------
+    if bnb_price is None or ton_price is None:
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": "the-open-network", "vs_currencies": "usd"},
+                    params={
+                        "ids": "binancecoin,the-open-network",
+                        "vs_currencies": "usd",
+                    },
                 )
-                val = resp.json().get("the-open-network", {}).get("usd")
-                if val:
-                    ton_price = float(val)
-                    logger.info("TON price (CoinGecko fallback): $%.4f", ton_price)
+                resp.raise_for_status()
+                data = resp.json()
+                if bnb_price is None and "binancecoin" in data:
+                    bnb_price = float(data["binancecoin"]["usd"])
+                    logger.info("BNB price (CoinGecko): $%.2f", bnb_price)
+                if ton_price is None and "the-open-network" in data:
+                    ton_price = float(data["the-open-network"]["usd"])
+                    logger.info("TON price (CoinGecko): $%.4f", ton_price)
         except Exception as e:
-            logger.warning("CoinGecko TON fallback failed: %s", e)
+            logger.warning("CoinGecko fallback failed: %s", e)
 
+    # ---------- ৩. চূড়ান্ত হার্ডকোড fallback ----------
     prices = {
-        "bnb": bnb_price if bnb_price else 600,
+        "bnb": bnb_price if bnb_price else 740.0,
         "ton": ton_price if ton_price else 1.46,
     }
+
     _crypto_cache["prices"] = prices
     _crypto_cache["ts"] = now
     logger.info("Crypto prices final: BNB=$%.2f, TON=$%.4f", prices["bnb"], prices["ton"])
@@ -1213,7 +1244,6 @@ def main():
     application.add_handler(CommandHandler("withdraw", withdraw_command))
     application.add_handler(CommandHandler("support", support_command))
 
-    # Custom deposit amount message handler (group=1 যাতে অন্য handler এর সাথে conflict না হয়)
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\d+(\.\d+)?$"),
@@ -1222,11 +1252,9 @@ def main():
         group=1,
     )
 
-    # Broadcast filter (group=2, highest priority থাকবে না, কিন্তু আলাদা গ্রুপে নিরাপদ)
     broadcast_filter = BroadcastModeFilter()
     application.add_handler(MessageHandler(broadcast_filter, admin_broadcast_send), group=2)
 
-    # Redeem code handler (group=3)
     application.add_handler(
         MessageHandler(filters.Regex(r"^balance-key-"), redeem_code),
         group=3,
